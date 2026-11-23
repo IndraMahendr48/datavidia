@@ -1,0 +1,25 @@
+# data kompetisi (besar, unduh pakai data.py)
+/data
+/train
+/test
+Task-1-Datavidia-11.0/
+sample_submission.csv
+*.csv
+# environment & cache
+.venv/
+venv/
+__pycache__/
+*.pyc
+.ipynb_checkpoints/
+cache/
+catboost_info/
+# hasil training (dibagikan lewat Drive, bukan git)
+artifacts/
+submissions/
+*.npy
+*.parquet
+*.cbm
+# rahasia
+.env
+kaggle.json
+.DS_Store
