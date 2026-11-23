@@ -177,17 +177,21 @@ ID_COLS = ["shipment_id", "customer_id", "courier_id", "cour_hub_id", "route_pai
 FEAT_FILE = "features_v2.parquet"
 
 
-def build(data_dir: str, cache_dir: str | None = None) -> pl.DataFrame:
-    """Bangun tabel fitur gabungan train+test (kolom `is_test`). Tanpa target leakage."""
+def build(data_dir: str, cache_dir: str | None = None, tables: dict | None = None) -> pl.DataFrame:
+    """Bangun tabel fitur gabungan train+test (kolom `is_test`). Tanpa target leakage.
+
+    `tables` (opsional): {split: {nama_tabel: DataFrame}} yang sudah di-load; kalau None dibaca dari CSV.
+    """
     if cache_dir and os.path.exists(os.path.join(cache_dir, FEAT_FILE)):
         return pl.read_parquet(os.path.join(cache_dir, FEAT_FILE))
-    lookups = {k: read(data_dir, "train", k) for k in ["customers", "couriers", "hubs", "service_packages", "promotions"]}
+    get = (lambda sp, nm: tables[sp][nm]) if tables else (lambda sp, nm: read(data_dir, sp, nm))
+    lookups = {k: get("train", k) for k in ["customers", "couriers", "hubs", "service_packages", "promotions"]}
     parts = []
     for split in ["train", "test"]:
-        sh = read(data_dir, split, "shipments")
+        sh = get(split, "shipments")
         df = join_lookups(sh, lookups)
         for fn, name in [(agg_scan, "scan_events"), (agg_route, "route_segments"), (agg_invoice, "invoices")]:
-            a = fn(read(data_dir, split, name))
+            a = fn(get(split, name))
             assert a["shipment_id"].n_unique() == a.height
             df = df.join(a, on="shipment_id", how="left", maintain_order="left")
         assert df.height == sh.height

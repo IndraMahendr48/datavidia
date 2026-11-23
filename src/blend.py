@@ -1,34 +1,22 @@
 """Ensemble + optimasi bobot kelas + submission. Usage: python src/blend.py lgb_s0 xgb_s0 cat_s0"""
 import json, os, sys
 import numpy as np, polars as pl
-from scipy.optimize import minimize
 from sklearn.metrics import log_loss
 
 sys.path.insert(0, os.path.dirname(__file__))
-from common import CLASSES, K, macro_f1, optimize_class_weights
+from common import CLASSES, K, blend, fit_blend_weights, macro_f1, optimize_class_weights
 
 ART = "artifacts"
 names = sys.argv[1:]
 folds = np.load(f"{ART}/folds.npy")
 sh = pl.read_csv("data/train/shipments.csv", columns=["status_penanganan"])
 y = sh["status_penanganan"].replace_strict({c: i for i, c in enumerate(CLASSES)}).to_numpy()
-oofs = [np.load(f"{ART}/oof_{n.replace('_s', '_s', 1)}.npy") for n in names]
+oofs = [np.load(f"{ART}/oof_{n}.npy") for n in names]
 tests = [np.load(f"{ART}/test_{n}.npy") for n in names]
 for n, o in zip(names, oofs):
     print(f"{n:10s} logloss={log_loss(y, o):.4f} f1={macro_f1(y, o):.4f}")
 
-# bobot blend: minimisasi logloss (geometric mean of probs, softmax weights)
-def blend(ps, w):
-    lp = sum(wi * np.log(np.clip(p, 1e-7, 1)) for wi, p in zip(w, ps))
-    e = np.exp(lp - lp.max(1, keepdims=True))
-    return e / e.sum(1, keepdims=True)
-
-if len(names) > 1:
-    obj = lambda a: log_loss(y, blend(oofs, np.exp(a) / np.exp(a).sum()))
-    a = minimize(obj, np.zeros(len(names)), method="Nelder-Mead", options=dict(maxiter=200)).x
-    bw = np.exp(a) / np.exp(a).sum()
-else:
-    bw = np.ones(1)
+bw = fit_blend_weights(oofs, y)
 oof_b, test_b = blend(oofs, bw), blend(tests, bw)
 print("blend weights", dict(zip(names, bw.round(3))), f"logloss={log_loss(y, oof_b):.4f} f1={macro_f1(y, oof_b):.4f}")
 

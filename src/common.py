@@ -6,10 +6,11 @@ import os
 import numpy as np
 import pandas as pd
 import polars as pl
-from sklearn.metrics import f1_score
+from sklearn.metrics import f1_score, log_loss
 from sklearn.model_selection import StratifiedKFold
 
 from features import CAT_COLS, CLASSES, ID_COLS, TARGET
+from te import encode_fold
 
 K = len(CLASSES)
 
@@ -81,7 +82,6 @@ def optimize_class_weights(proba, y, n_iter: int = 3, grid=None) -> np.ndarray:
 def add_te(X_parts: list[pd.DataFrame], codes: dict, y: np.ndarray, tr_idx, other_idx: list,
            seed: int = 0, keep_tables: bool = False):
     """Tambahkan kolom TE ke X_train (OOF) dan ke X lain (TE penuh dari tr_idx)."""
-    from te import encode_fold
     tables = {}
     Xtr, others = X_parts[0], X_parts[1:]
     for name, (c, nl, m) in codes.items():
@@ -173,11 +173,10 @@ def fit_predict(model: str, Xtr, ytr, Xva, yva, Xte, seed: int, path: str):
         dva = xgb.DMatrix(Xva, yva, enable_categorical=True)
         m = xgb.train({**XGB_PARAMS, "seed": seed}, dtr, 20000, evals=[(dva, "va")], early_stopping_rounds=200,
                       verbose_eval=500)
-        r = (0, m.best_iteration + 1)
-        m = m[: m.best_iteration + 1]  # simpan hanya pohon sampai best iteration
+        best = m.best_iteration + 1
+        m = m[:best]  # simpan hanya pohon sampai best iteration
         m.save_model(path + ".json")
-        return (m, m.predict(dva, iteration_range=r),
-                m.predict(xgb.DMatrix(Xte, enable_categorical=True), iteration_range=r), m.best_iteration + 1)
+        return m, m.predict(dva), m.predict(xgb.DMatrix(Xte, enable_categorical=True)), best
     if model == "cat":
         from catboost import CatBoostClassifier, Pool
         cats = [c for c in Xtr.columns if str(Xtr[c].dtype) == "category"]
@@ -205,3 +204,61 @@ def load_predict(model: str, path: str, X: pd.DataFrame) -> np.ndarray:
         cats = [c for c in X.columns if str(X[c].dtype) == "category"]
         return m.predict_proba(Pool(X.assign(**{c: X[c].astype(str) for c in cats}), cat_features=cats))
     raise ValueError(model)
+
+
+def run_cv(model: str, seed: int, df_keys: pl.DataFrame, X: pd.DataFrame, y_all: np.ndarray, tr_all: np.ndarray,
+           te_all: np.ndarray, codes: dict, folds: np.ndarray, art: str = "artifacts", quick: bool = False):
+    """Training 5-fold untuk satu model. Simpan model per fold, tabel TE, OOF & proba test."""
+    import gc, json, time
+    os.makedirs(f"{art}/models", exist_ok=True)
+    os.makedirs(f"{art}/te", exist_ok=True)
+    oof = np.zeros((len(tr_all), K), dtype=np.float32)
+    test_p = np.zeros((len(te_all), K), dtype=np.float32)
+    log = []
+    for k in range(1 if quick else int(folds.max()) + 1):
+        t0 = time.time()
+        tr_idx, va_idx = tr_all[folds != k], tr_all[folds == k]
+        if quick:  # smoke test: 100rb baris saja
+            tr_idx = np.random.default_rng(0).choice(tr_idx, 100_000, replace=False)
+        Xtr, Xva, Xte = X.iloc[tr_idx].copy(), X.iloc[va_idx].copy(), X.iloc[te_all].copy()
+        tables = add_te([Xtr, Xva, Xte], codes, y_all, tr_idx, [va_idx, te_all], seed=k, keep_tables=True)
+        if not quick and not os.path.exists(f"{art}/te/te_f{k}_customer_id.parquet"):
+            save_te_tables(df_keys, codes, tables, f"{art}/te/te_f{k}.parquet")
+        if k == 0 and not quick:
+            json.dump(list(Xtr.columns), open(f"{art}/features.json", "w"))
+        ytr, yva = y_all[tr_idx], y_all[va_idx]
+        m, p_va, p_te, it = fit_predict(model, Xtr, ytr, Xva, yva, Xte, seed + k, f"{art}/models/{model}_s{seed}_f{k}")
+        oof[folds == k], test_p = p_va, test_p + p_te / (int(folds.max()) + 1)
+        r = dict(fold=k, iters=int(it), f1=macro_f1(yva, p_va), mins=round((time.time() - t0) / 60, 1))
+        print(json.dumps(r), flush=True)
+        log.append(r)
+        del Xtr, Xva, Xte, m
+        gc.collect()
+    if quick:
+        print("QUICK smoke test selesai — instalasi OK. Jalankan ulang tanpa QUICK=1 untuk training penuh.")
+        return None
+    y_tr = y_all[tr_all]
+    summary = dict(model=model, seed=seed, f1_argmax=macro_f1(y_tr, oof), logloss=float(log_loss(y_tr, oof)),
+                   fold_f1=[r["f1"] for r in log], fold_iters=[r["iters"] for r in log])
+    print(json.dumps(summary), flush=True)
+    np.save(f"{art}/oof_{model}_s{seed}.npy", oof)
+    np.save(f"{art}/test_{model}_s{seed}.npy", test_p)
+    json.dump(summary, open(f"{art}/summary_{model}_s{seed}.json", "w"), indent=1)
+    return summary
+
+
+def blend(ps: list, w) -> np.ndarray:
+    """Rata-rata geometrik berbobot dari beberapa matriks proba."""
+    lp = sum(wi * np.log(np.clip(p, 1e-7, 1)) for wi, p in zip(w, ps))
+    e = np.exp(lp - lp.max(1, keepdims=True))
+    return e / e.sum(1, keepdims=True)
+
+
+def fit_blend_weights(ps: list, y: np.ndarray) -> np.ndarray:
+    """Bobot blend (softmax) yang meminimalkan logloss OOF."""
+    from scipy.optimize import minimize
+    if len(ps) == 1:
+        return np.ones(1)
+    obj = lambda a: log_loss(y, blend(ps, np.exp(a) / np.exp(a).sum()))
+    a = minimize(obj, np.zeros(len(ps)), method="Nelder-Mead", options=dict(maxiter=200)).x
+    return np.exp(a) / np.exp(a).sum()

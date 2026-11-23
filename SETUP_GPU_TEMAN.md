@@ -1,6 +1,7 @@
-# Panduan Setup & Training GPU (CatBoost + XGBoost)
+# Panduan Setup & Training (LightGBM + CatBoost + XGBoost)
 
-Halo! Tugasmu: jalankan training **CatBoost** dan **XGBoost** di GPU, lalu kirim hasilnya ke Indra.
+Halo! Tugasmu: jalankan training **LightGBM** (CPU), **CatBoost** dan **XGBoost** (GPU), lalu kirim hasilnya ke Indra.
+Laptop Indra tidak kuat untuk training penuh, jadi semua training dijalankan di PC-mu.
 Ikuti langkahnya berurutan, sebagian besar tinggal copy-paste.
 
 **Kebutuhan:** GPU NVIDIA (VRAM ≥ 6 GB) + driver terbaru, RAM ≥ 16 GB (tutup aplikasi berat saat training),
@@ -71,29 +72,45 @@ Harus muncul `QUICK smoke test selesai — instalasi OK`. Run pertama sekalian m
 
 ## 4. Training penuh
 
-Jalankan **satu per satu, jangan bersamaan** (RAM bisa habis):
+Jalankan **satu per satu, jangan bersamaan** (RAM bisa habis). Urutan prioritas: CatBoost → LightGBM → XGBoost.
 
 - **Linux / macOS:**
   ```bash
   USE_GPU=1 python src/train.py cat 0 2>&1 | tee train_cat_s0.log
+  python src/train.py lgb 0 2>&1 | tee train_lgb_s0.log
   USE_GPU=1 python src/train.py xgb 0 2>&1 | tee train_xgb_s0.log
   ```
 - **Windows (PowerShell):**
   ```powershell
   $env:USE_GPU="1"
   python src/train.py cat 0 2>&1 | Tee-Object train_cat_s0.log
+  python src/train.py lgb 0 2>&1 | Tee-Object train_lgb_s0.log
   python src/train.py xgb 0 2>&1 | Tee-Object train_xgb_s0.log
   ```
 
+Perkiraan waktu: LightGBM (CPU) ±20–25 menit per fold di CPU 10 core, jadi ±2 jam total. CatBoost/XGBoost GPU
+biasanya lebih cepat. Biarkan PC menyala dan jangan sleep.
+
 Setiap model terdiri dari 5 fold. Tiap fold mencetak satu baris seperti
-`{"fold": 0, "iters": ..., "f1": 0.61..., "mins": ...}`, dan di akhir muncul ringkasan `{"model": "cat", ... "f1_w": ...}`.
+`{"fold": 0, "iters": ..., "f1": 0.61..., "mins": ...}`, dan di akhir muncul ringkasan `{"model": "cat", "seed": 0, "f1_argmax": ..., "logloss": ...}`.
 Kalau ada error, kirim screenshot / isi file log ke Indra.
 
 ## 5. Kirim hasil ke Indra ✅
 
-Setelah **CatBoost selesai** (XGBoost menyusul kalau sudah selesai juga), zip file berikut:
+Kirim **per model begitu selesai** (tidak perlu menunggu ketiganya). Isi zip:
 
 ```
+# selalu ikutkan (cukup sekali):
+artifacts/folds.npy
+artifacts/features.json
+artifacts/te/                      (seluruh folder)
+# LightGBM:
+artifacts/oof_lgb_s0.npy
+artifacts/test_lgb_s0.npy
+artifacts/summary_lgb_s0.json
+artifacts/models/lgb_s0_f0.txt ... lgb_s0_f4.txt
+train_lgb_s0.log
+# CatBoost:
 artifacts/oof_cat_s0.npy
 artifacts/test_cat_s0.npy
 artifacts/summary_cat_s0.json
@@ -107,12 +124,12 @@ artifacts/models/xgb_s0_f0.json ... xgb_s0_f4.json
 train_xgb_s0.log
 ```
 
-Contoh perintah zip:
+Paling gampang: zip seluruh folder `artifacts/` + semua log:
 
-- **Linux / macOS:** `zip -r hasil_gpu.zip artifacts/*cat* artifacts/*xgb* artifacts/models train_*.log`
-- **Windows (PowerShell):** `Compress-Archive -Path artifacts\*cat*,artifacts\*xgb*,artifacts\models,train_*.log -DestinationPath hasil_gpu.zip`
+- **Linux / macOS:** `zip -r hasil_training.zip artifacts train_*.log`
+- **Windows (PowerShell):** `Compress-Archive -Path artifacts,train_*.log -DestinationPath hasil_training.zip`
 
-Upload `hasil_gpu.zip` ke **Google Drive** lalu kirim link-nya ke Indra.
+Upload `hasil_training.zip` ke **Google Drive** lalu kirim link-nya ke Indra.
 Jangan push file ini ke GitHub (ukurannya besar dan sudah di-`.gitignore`).
 
 ---
