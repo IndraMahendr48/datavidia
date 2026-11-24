@@ -23,3 +23,5 @@ submissions/
 .env
 kaggle.json
 .DS_Store
+# log training lokal
+*.log

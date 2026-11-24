@@ -6,7 +6,7 @@ import os
 import numpy as np
 import pandas as pd
 import polars as pl
-from sklearn.metrics import f1_score, log_loss
+from sklearn.metrics import log_loss
 from sklearn.model_selection import StratifiedKFold
 
 from features import CAT_COLS, CLASSES, ID_COLS, TARGET
@@ -55,28 +55,132 @@ def make_folds(y: np.ndarray, n_splits: int = 5, seed: int = 42) -> np.ndarray:
     return f
 
 
-def macro_f1(y, proba, w=None) -> float:
+def macro_f1(y, proba, w=None, sw=None) -> float:
+    """Macro F1 dari argmax(proba * w). `sw` = bobot sampel (mis. koreksi pergeseran bulan train→test)."""
     p = proba if w is None else proba * w
-    return f1_score(y, p.argmax(1), average="macro")
+    k = proba.shape[1]  # confusion matrix via bincount: identik dgn sklearn f1_score(macro), jauh lebih cepat
+    cm = np.bincount(np.asarray(y) * k + p.argmax(1), weights=sw, minlength=k * k).reshape(k, k)
+    tp, pred, true = np.diag(cm), cm.sum(0), cm.sum(1)
+    denom = pred + true
+    return float(np.mean(np.divide(2 * tp, denom, out=np.zeros(k), where=denom > 0)))
 
 
-def optimize_class_weights(proba, y, n_iter: int = 3, grid=None) -> np.ndarray:
+def month_shift_weights(month_train: np.ndarray, month_test: np.ndarray) -> np.ndarray:
+    """Importance weight per baris train = P_test(bulan) / P_train(bulan). Hanya memakai fitur test, bukan label."""
+    pt = np.bincount(month_train, minlength=13) / len(month_train)
+    pe = np.bincount(month_test, minlength=13) / len(month_test)
+    r = np.divide(pe, pt, out=np.ones_like(pe), where=pt > 0)
+    return r[month_train]
+
+
+def optimize_class_weights(proba, y, n_iter: int = 3, grid=None, sw=None) -> np.ndarray:
     """Coordinate ascent pada bobot multiplikatif per kelas (log-grid)."""
     grid = np.exp(np.linspace(-1.2, 1.2, 41)) if grid is None else grid
     w = np.ones(proba.shape[1])
-    best = macro_f1(y, proba, w)
+    best = macro_f1(y, proba, w, sw)
     for _ in range(n_iter):
         for k in range(1, proba.shape[1]):  # kelas 0 jadi referensi
             cand = w.copy()
             scores = []
             for g in grid:
                 cand[k] = w[k] * g
-                scores.append(macro_f1(y, proba, cand))
+                scores.append(macro_f1(y, proba, cand, sw))
             j = int(np.argmax(scores))
             if scores[j] > best:
                 best, w[k] = scores[j], w[k] * grid[j]
         grid = np.exp(np.linspace(-0.3, 0.3, 21))
     return w / w.sum() * len(w)
+
+
+def f1_matrix(y, proba, W, sw=None) -> float:
+    """Macro F1 dari aturan keputusan linear umum: argmax(proba @ W)."""
+    return macro_f1(y, proba @ W, None, sw)
+
+
+def optimize_decision_matrix(proba, y, w_diag, n_iter: int = 2) -> np.ndarray:
+    """Aturan keputusan optimal Macro F1 berbentuk argmax(P·W) dengan W matriks penuh (Narasimhan et al., 2015).
+
+    Mulai dari diag(w_diag) (bobot kelas), lalu coordinate ascent pada elemen off-diagonal W[i, j]
+    (kontribusi proba kelas i ke skor kelas j), langkah relatif terhadap W[j, j].
+    """
+    W = np.diag(np.asarray(w_diag, dtype=np.float64)).astype(np.float32)
+    p = proba.astype(np.float32)
+    best = f1_matrix(y, p, W)
+    grid = np.linspace(-0.3, 0.3, 13)
+    for _ in range(n_iter):
+        for i in range(W.shape[0]):
+            for j in range(W.shape[0]):
+                if i == j:
+                    continue
+                base, scores = W[i, j], []
+                for g in grid:
+                    W[i, j] = base + g * W[j, j]
+                    scores.append(f1_matrix(y, p, W))
+                b = int(np.argmax(scores))
+                if scores[b] > best + 1e-6:
+                    best, W[i, j] = scores[b], base + grid[b] * W[j, j]
+                else:
+                    W[i, j] = base
+        grid = grid / 3
+    return W
+
+
+# Residual target encoding (efek acak entitas ala mixed-effects / GPBoost):
+# R = one-hot(y) − proba model tahap A yang TIDAK memakai label customer → rata-rata R per customer (shrink ke 0)
+# = kecenderungan laten customer SETELAH efek fitur paket dibuang.
+RESID_KEYS = {"customer_id": (["customer_id"], 1.0)}
+
+
+def stage_a_oof(X: pd.DataFrame, y_all: np.ndarray, tr_all: np.ndarray, folds: np.ndarray, df: pl.DataFrame,
+                verbose: bool = True) -> np.ndarray:
+    """Tahap A: OOF proba CatBoost (lr 0.08) tanpa TE berbasis customer. Fold sama dengan model utama."""
+    import gc, json, time
+    from catboost import CatBoostClassifier, Pool
+    codes_a = te_codes(df, {k: v for k, v in TE_KEYS.items() if "customer_id" not in v[0]})
+    params = dict(CAT_PARAMS, learning_rate=0.08, iterations=4000, verbose=0)
+    oof = np.zeros((len(tr_all), K), dtype=np.float32)
+    for k in range(int(folds.max()) + 1):
+        t = time.time()
+        tr_idx, va_idx = tr_all[folds != k], tr_all[folds == k]
+        Xtr, Xva = X.iloc[tr_idx].copy(), X.iloc[va_idx].copy()
+        add_te([Xtr, Xva], codes_a, y_all, tr_idx, [va_idx], seed=k)
+        cats = [c for c in Xtr.columns if str(Xtr[c].dtype) == "category"]
+        conv = lambda d: d.assign(**{c: d[c].astype(str) for c in cats})
+        pva = Pool(conv(Xva), y_all[va_idx], cat_features=cats)
+        m = CatBoostClassifier(**params, random_seed=k)
+        m.fit(Pool(conv(Xtr), y_all[tr_idx], cat_features=cats), eval_set=pva, use_best_model=True)
+        oof[folds == k] = m.predict_proba(pva)
+        if verbose:
+            print(json.dumps(dict(stage_a_fold=k, iters=m.get_best_iteration(),
+                                  mins=round((time.time() - t) / 60, 1))), flush=True)
+        del Xtr, Xva, m; gc.collect()
+    return oof
+
+
+def resid_matrix(y_all: np.ndarray, tr_all: np.ndarray, oof_a: np.ndarray) -> np.ndarray:
+    R = np.zeros((len(y_all), K), dtype=np.float32)
+    R[tr_all] = np.eye(K, dtype=np.float32)[y_all[tr_all]] - oof_a
+    return R
+
+
+def add_resid(X_parts: list[pd.DataFrame], rcodes: dict, R_all: np.ndarray, tr_idx, other_idx: list,
+              seed: int = 0, keep_tables: bool = False):
+    """Tambahkan kolom residual TE (rte_*) — OOF inner-fold untuk train, tabel penuh untuk set lain."""
+    from te import encode_fold_resid
+    tables = {}
+    Xtr, others = X_parts[0], X_parts[1:]
+    for name, (c, nl, m) in rcodes.items():
+        (etr, ntr), applied, tab = encode_fold_resid(c, R_all, tr_idx, other_idx, nl, m, seed=seed)
+        for j, cls in enumerate(CLASSES):
+            Xtr[f"rte_{name}_{cls}"] = etr[:, j]
+        Xtr[f"rte_{name}_n"] = ntr
+        for Xo, (eo, no) in zip(others, applied):
+            for j, cls in enumerate(CLASSES):
+                Xo[f"rte_{name}_{cls}"] = eo[:, j]
+            Xo[f"rte_{name}_n"] = no
+        if keep_tables:
+            tables[name] = tab
+    return tables
 
 
 def add_te(X_parts: list[pd.DataFrame], codes: dict, y: np.ndarray, tr_idx, other_idx: list,
@@ -114,23 +218,24 @@ def prepare_matrix(df: pl.DataFrame):
     return X, y_all, np.where(~is_test)[0], np.where(is_test)[0]
 
 
-def save_te_tables(df: pl.DataFrame, codes: dict, tables: dict, path_prefix: str):
-    """Simpan tabel TE (nilai kunci → 7 proba + n) supaya inference tidak perlu label train."""
-    for name, (cols, _) in TE_KEYS.items():
+def save_te_tables(df: pl.DataFrame, codes: dict, tables: dict, path_prefix: str, keys_def: dict = TE_KEYS,
+                   col_prefix: str = "te"):
+    """Simpan tabel TE (nilai kunci → 7 nilai + n) supaya inference tidak perlu label train."""
+    for name, (cols, _) in keys_def.items():
         tab, n = tables[name]
         keys = (df.select(cols).with_columns(pl.Series("_code", codes[name][0]))
                 .unique("_code").sort("_code"))
         out = keys.with_columns(
-            *[pl.Series(f"te_{name}_{c}", tab[keys["_code"].to_numpy(), j]) for j, c in enumerate(CLASSES)],
-            pl.Series(f"te_{name}_n", n[keys["_code"].to_numpy()]),
+            *[pl.Series(f"{col_prefix}_{name}_{c}", tab[keys["_code"].to_numpy(), j]) for j, c in enumerate(CLASSES)],
+            pl.Series(f"{col_prefix}_{name}_n", n[keys["_code"].to_numpy()]),
         ).drop("_code")
         out.write_parquet(path_prefix.replace(".parquet", f"_{name}.parquet"))
 
 
-def apply_te_tables(df: pl.DataFrame, X: pd.DataFrame, path_prefix: str) -> pd.DataFrame:
-    """Inference: gabungkan tabel TE tersimpan ke baris df (urutan dipertahankan)."""
+def apply_te_tables(df: pl.DataFrame, X: pd.DataFrame, path_prefix: str, keys_def: dict = TE_KEYS) -> pd.DataFrame:
+    """Inference: gabungkan tabel TE tersimpan ke baris df (urutan dipertahankan). Kunci tak dikenal → NaN."""
     X = X.copy()
-    for name, (cols, _) in TE_KEYS.items():
+    for name, (cols, _) in keys_def.items():
         tab = pl.read_parquet(path_prefix.replace(".parquet", f"_{name}.parquet"))
         j = df.select(cols).join(tab, on=cols, how="left", maintain_order="left")
         assert j.height == df.height
@@ -148,6 +253,10 @@ XGB_PARAMS = dict(objective="multi:softprob", num_class=K, eta=0.05, max_depth=8
                   eval_metric="mlogloss", nthread=10, max_cat_to_onehot=8)
 CAT_PARAMS = dict(loss_function="MultiClass", learning_rate=0.08, depth=8, l2_leaf_reg=5, iterations=4000,
                   od_type="Iter", od_wait=150, border_count=128, verbose=500)
+for _env, _key, _typ in [("CAT_LR", "learning_rate", float), ("CAT_DEPTH", "depth", int),
+                         ("CAT_ITERS", "iterations", int)]:  # override opsional (dicatat di summary_*.json)
+    if os.environ.get(_env):
+        CAT_PARAMS[_key] = _typ(os.environ[_env])
 if os.environ.get("USE_GPU") == "1":  # CatBoost & XGBoost di GPU (NVIDIA + CUDA)
     CAT_PARAMS.update(task_type="GPU", devices="0")
     XGB_PARAMS.update(device="cuda")
@@ -207,8 +316,13 @@ def load_predict(model: str, path: str, X: pd.DataFrame) -> np.ndarray:
 
 
 def run_cv(model: str, seed: int, df_keys: pl.DataFrame, X: pd.DataFrame, y_all: np.ndarray, tr_all: np.ndarray,
-           te_all: np.ndarray, codes: dict, folds: np.ndarray, art: str = "artifacts", quick: bool = False):
-    """Training 5-fold untuk satu model. Simpan model per fold, tabel TE, OOF & proba test."""
+           te_all: np.ndarray, codes: dict, folds: np.ndarray, art: str = "artifacts", quick: bool = False,
+           rcodes: dict | None = None, R_all: np.ndarray | None = None):
+    """Training 5-fold untuk satu model. Simpan model per fold, tabel TE, OOF & proba test.
+
+    rcodes/R_all (opsional): tambah residual TE (RESID_KEYS) → tabel di te/rte_f{k}_*.parquet.
+    Urutan fitur model disimpan di features_{model}_s{seed}.json.
+    """
     import gc, json, time
     os.makedirs(f"{art}/models", exist_ok=True)
     os.makedirs(f"{art}/te", exist_ok=True)
@@ -224,8 +338,14 @@ def run_cv(model: str, seed: int, df_keys: pl.DataFrame, X: pd.DataFrame, y_all:
         tables = add_te([Xtr, Xva, Xte], codes, y_all, tr_idx, [va_idx, te_all], seed=k, keep_tables=True)
         if not quick and not os.path.exists(f"{art}/te/te_f{k}_customer_id.parquet"):
             save_te_tables(df_keys, codes, tables, f"{art}/te/te_f{k}.parquet")
+        if rcodes is not None:
+            rtables = add_resid([Xtr, Xva, Xte], rcodes, R_all, tr_idx, [va_idx, te_all], seed=k, keep_tables=True)
+            if not quick:
+                save_te_tables(df_keys, rcodes, rtables, f"{art}/te/rte_f{k}.parquet", RESID_KEYS, "rte")
         if k == 0 and not quick:
-            json.dump(list(Xtr.columns), open(f"{art}/features.json", "w"))
+            if rcodes is None:
+                json.dump(list(Xtr.columns), open(f"{art}/features.json", "w"))
+            json.dump(list(Xtr.columns), open(f"{art}/features_{model}_s{seed}.json", "w"))
         ytr, yva = y_all[tr_idx], y_all[va_idx]
         m, p_va, p_te, it = fit_predict(model, Xtr, ytr, Xva, yva, Xte, seed + k, f"{art}/models/{model}_s{seed}_f{k}")
         oof[folds == k], test_p = p_va, test_p + p_te / (int(folds.max()) + 1)
@@ -239,7 +359,8 @@ def run_cv(model: str, seed: int, df_keys: pl.DataFrame, X: pd.DataFrame, y_all:
         return None
     y_tr = y_all[tr_all]
     summary = dict(model=model, seed=seed, f1_argmax=macro_f1(y_tr, oof), logloss=float(log_loss(y_tr, oof)),
-                   fold_f1=[r["f1"] for r in log], fold_iters=[r["iters"] for r in log])
+                   fold_f1=[r["f1"] for r in log], fold_iters=[r["iters"] for r in log],
+                   params={"lgb": LGB_PARAMS, "xgb": XGB_PARAMS, "cat": CAT_PARAMS}[model])
     print(json.dumps(summary), flush=True)
     np.save(f"{art}/oof_{model}_s{seed}.npy", oof)
     np.save(f"{art}/test_{model}_s{seed}.npy", test_p)

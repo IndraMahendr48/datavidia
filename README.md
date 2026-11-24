@@ -16,14 +16,17 @@ Konteks kompetisi & EDA awal: [Datavidia11_Task1_Overview.md](Datavidia11_Task1_
 | Komponen | Status | Catatan |
 |---|---|---|
 | Pipeline fitur (`features_v2`) | ✅ **dibekukan** | 560 fitur; perubahan hanya lewat aturan §6.2 |
-| LightGBM 5-fold | ⏳ di PC teman (CPU) | fold 0 (lr 0,03): Macro F1 argmax 0,6167 · eksperimen 1 fold + bobot kelas ±0,623 |
-| CatBoost 5-fold | ⏳ di PC teman (GPU) | lihat [SETUP_GPU_TEMAN.md](SETUP_GPU_TEMAN.md) |
-| XGBoost 5-fold | ⏳ di PC teman (GPU) | idem |
-| Ensemble + bobot kelas | script siap | `src/blend.py` |
-| Notebook final | draft, belum dieksekusi penuh | `datavidia11_task1_solution.ipynb` (di-generate, lihat §5); diisi setelah artefak lengkap |
-| Tes end-to-end (data kecil) | ✅ lolos | training + inference + reproducibility untuk LGB, Cat, XGB |
+| **Residual TE customer** (tahap A + `RESID=1`) | ✅ | +0,003 logloss / +0,003 F1 — peningkatan terbesar (notebook §6.1) |
+| CatBoost 5-fold (GPU) | ✅ | `cat_s11` (lr 0,02, residual) logloss 0,7786 · `cat_s12` (lr 0,04, residual) 0,7795 |
+| XGBoost 5-fold (GPU) | ✅ | `xgb_s11` (residual) logloss 0,7834 |
+| Varian tanpa residual | ✅ | `cat_s0/s1/s2`, `xgb_s0` (hedge) |
+| LightGBM 5-fold | opsional | belum dipakai di ensemble final |
+| Ensemble + **matriks keputusan** Macro F1 | ✅ | `src/blend.py`; matriks penuh +0,001 vs bobot diagonal (nested, 5/5 fold) |
+| Notebook final | ✅ dieksekusi penuh | `submission.csv` identik dengan `sub_cat_s11+cat_s12+xgb_s11_mat.csv` |
 
-Referensi LB (23 Nov): top ±0,602 · top-20 ≥ 0,594.
+**Nested CV Macro F1** (estimasi jujur): CatBoost 0,6256 → +XGB 0,6267 → +matriks & lr kecil 0,6283 →
+**+residual TE 0,6294** (final). Public LB: 0,59447 (CatBoost) · 0,59500 (Cat+XGB).
+Selisih CV→LB stabil ±0,031 untuk semua submission.
 
 ## 2. Setup (sekali saja)
 
@@ -83,7 +86,17 @@ USE_GPU=1 python src/train.py cat 0       # CatBoost (GPU NVIDIA)
 USE_GPU=1 python src/train.py xgb 0       # XGBoost  (GPU NVIDIA)
 ```
 
+**Konfigurasi final (residual TE)** — butuh tahap A sekali (±12 menit GPU):
+```bash
+USE_GPU=1 python src/stage_a.py                                            # → artifacts/stageA_oof.npy
+USE_GPU=1 RESID=1 CAT_LR=0.02 CAT_ITERS=15000 python src/train.py cat 11   # ±50 menit
+USE_GPU=1 RESID=1 CAT_LR=0.04 CAT_ITERS=10000 python src/train.py cat 12   # ±25 menit
+USE_GPU=1 RESID=1 python src/train.py xgb 11                               # ±65 menit
+python src/blend.py cat_s11 cat_s12 xgb_s11      # → submissions/sub_cat_s11+cat_s12+xgb_s11_mat.csv
+```
+
 * Argumen kedua = **seed** model (fold tetap sama). Seed lain (mis. `1`) → bisa di-ensemble sebagai `lgb_s1`.
+* Eksperimen cepat CatBoost GPU 1 fold: `python src/exp_cat.py <nama> [--lr 0.04] [--resid] [--te route]`.
 * `QUICK=1` → smoke test 1 fold kecil (±2 menit) untuk cek instalasi.
 * **Jalankan satu training per mesin**: dua sekaligus = RAM habis (`Killed`).
 * Setelah selesai, **upload ke Drive** (§6.3), jangan ke GitHub.

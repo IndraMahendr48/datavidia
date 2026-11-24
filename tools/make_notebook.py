@@ -44,7 +44,7 @@ code_raw = lambda s: cells.append(nbf.v4.new_code_cell(s.strip()))
 md("""
 # Datavidia 11.0 — Task 1: Klasifikasi `status_penanganan`
 
-**Metrik:** Macro F1 (7 kelas) · **Validasi:** Stratified 5-Fold OOF · **Model:** LightGBM + CatBoost + XGBoost (ensemble)
+**Metrik:** Macro F1 (7 kelas) · **Validasi:** Stratified 5-Fold OOF · **Model:** CatBoost + XGBoost (ensemble, GPU); LightGBM opsional
 
 Notebook ini memuat seluruh pipeline: pemrosesan data, penggabungan 9 tabel, pembuatan fitur, pengembangan model,
 training, ensemble, optimasi Macro F1, dan **inferensi tanpa retrain** (memuat file model tersimpan).
@@ -95,7 +95,15 @@ pl.Config.set_tbl_rows(25); pl.Config.set_tbl_width_chars(160); pl.Config.set_fm
 
 # ------------------------------------------------------------------ konfigurasi
 MODE = "inference"                                   # "train" | "inference"
-MODEL_RUNS = [("lgb", 0), ("cat", 0), ("xgb", 0)]    # (model, seed) kandidat ensemble
+# (model, seed, residual TE?, override parameter) — kandidat ensemble; yang artefaknya tidak ada dilewati
+MODEL_RUNS = [  # ensemble final (semua dengan residual TE customer, Section 6.1)
+    ("cat", 11, True, {"learning_rate": 0.02, "iterations": 15000}),
+    ("cat", 12, True, {"learning_rate": 0.04, "iterations": 10000}),
+    ("xgb", 11, True, {}),
+]
+# Varian tanpa residual TE (hedge / pembanding), juga tersimpan di artifacts/:
+#   ("cat", 1, False, {"learning_rate": 0.02, "iterations": 15000}), ("cat", 2, False, {"learning_rate": 0.04,
+#   "iterations": 10000}), ("cat", 0, False, {}), ("xgb", 0, False, {})
 SEED = 42                                            # seed pembagian fold
 ART = "artifacts"                                    # model, tabel TE, OOF, proba test
 CACHE = "cache"                                      # cache tabel fitur (parquet)
@@ -198,8 +206,30 @@ print("KS statistic train vs test (terbesar):", [(c, round(s, 3)) for s, c in ks
 """)
 md("""
 Missing sedikit dan **tidak informatif** (proporsinya rata antar kelas), dan GBDT menanganinya secara native.
-KS semua kolom kecil → train dan test **split acak**, jadi Stratified K-Fold adalah skema validasi yang tepat
-(dikonfirmasi lagi dengan *adversarial validation* di Section 7).
+KS hampir semua kolom < 0,01. Pengecualiannya **`ship_month`** (KS ±0,03), yang diperiksa lebih dalam di bawah.
+""")
+code("""
+mon = (sh_tr.group_by("ship_month").agg(pl.len().alias("n_train"),
+                                         (pl.col(TARGET) == "normal").mean().alias("p_normal"),
+                                         (pl.col(TARGET) == "tertunda_operasional").mean().alias("p_tertunda"))
+       .join(tables["test"]["shipments"].group_by("ship_month").agg(pl.len().alias("n_test")), on="ship_month")
+       .with_columns((pl.col("n_test") / pl.col("n_test").sum()) / (pl.col("n_train") / pl.col("n_train").sum()))
+       .rename({"n_test": "rasio_test_train"}).drop("n_train").sort("ship_month"))
+fig, ax = plt.subplots(1, 2, figsize=(13, 3.4))
+ax[0].bar(mon["ship_month"], mon["rasio_test_train"], color="#4C72B0"); ax[0].axhline(1, color="k", lw=.8)
+ax[0].set(title="Proporsi bulan: test / train", xlabel="ship_month", ylim=(0.8, 1.15))
+ax[1].plot(mon["ship_month"], mon["p_tertunda"], "o-", label="tertunda_operasional")
+ax[1].plot(mon["ship_month"], mon["p_normal"], "o-", label="normal")
+ax[1].set(title="Proporsi kelas per bulan (train)", xlabel="ship_month"); ax[1].legend()
+plt.tight_layout(); plt.show()
+mon.with_columns(pl.exclude("ship_month").round(3))
+""")
+md("""
+**Temuan:** split train/test **tidak sepenuhnya acak** terhadap bulan. Test kelebihan bulan Okt–Des (rasio 1,08–1,12)
+dan kekurangan Mei–Agt (0,88–0,95). Bulan **3, 10, 11, 12 adalah musim sibuk**: `tertunda_operasional` naik dari
+±11% menjadi ±21%. Artinya prior kelas di test sedikit bergeser. Model tetap memakai `ship_month` sebagai fitur;
+dampak pergeseran ini terhadap bobot kelas diuji di Section 11 (hasilnya: dapat diabaikan).
+Untuk semua kolom lain, Stratified K-Fold tetap skema validasi yang tepat (lihat *adversarial validation* di Section 7).
 """)
 md("### 2.2 Temuan kunci: label menempel pada entitas")
 code("""
@@ -365,6 +395,25 @@ print(f"Macro F1 argmax TE customer IN-SAMPLE (bocor): {f1_score(_y, (_insample[
 print(f"Macro F1 argmax TE customer OOF (jujur)     : {f1_score(_y, (_oof * _w).argmax(1), average='macro'):.4f}")
 del _c, _insample, _oof; gc.collect();
 """)
+md("""
+### 6.1 Residual target encoding customer (efek acak ala *mixed-effects*) ⭐
+TE customer biasa = proporsi label paket lain milik customer. Masalahnya, label itu **tercampur efek fitur paket**:
+paket lain berlabel `klaim_hilang` mungkin karena barangnya mahal, bukan karena customer-nya "rawan klaim".
+Dengan rata-rata hanya ±2 paket/customer di train, campuran ini membuat estimasi kecenderungan customer bising.
+
+Solusi (prinsip *mixed-effects* / GPBoost: tree-boosting + efek acak per grup, Sigrist 2022):
+1. **Tahap A** — CatBoost 5-fold **tanpa** informasi label customer → proba OOF $\\hat p^A$.
+2. **Residual** $R_i = \\text{onehot}(y_i) - \\hat p^A_i$ = bagian label yang **tidak** dijelaskan fitur paket.
+3. **Residual TE** customer = rata-rata $R$ paket lain milik customer, di-*shrink* ke 0: $\\frac{\\sum R}{n + m}$ (m=1),
+   dihitung dengan skema OOF dua tingkat yang sama seperti TE biasa; tabelnya disimpan per fold (`te/rte_f*`).
+
+Anti-leakage: baris validasi/test hanya memakai residual baris train-fold; model tahap A tidak pernah melihat
+label customer, sehingga kebocoran yang tersisa hanya ke arah **konservatif** (mengecilkan sinyal).
+Hasil eksperimen fold 0 (CatBoost lr 0,08): logloss **0,7847 → 0,7817**, Macro F1 (+bobot) **0,6225 → 0,6259**
+— peningkatan terbesar di seluruh eksperimen.
+""")
+code_raw(grab("te.py", "fit_resid", "encode_fold_resid"))
+code_raw(grab("common.py", "RESID_KEYS", "stage_a_oof", "resid_matrix", "add_resid"))
 
 # ===================================================================================== 7
 md("""
@@ -413,19 +462,59 @@ Setiap perubahan diterima hanya jika **logloss** (metrik yang lebih stabil darip
 | 5 | Regularisasi (leaves 63, min_leaf 400, colsample 0,3, λ=10, lr 0,05) | 560 | **0,7871** | 0,6150 | 0,6232 | ✅ final |
 
 *Catatan: F1 "+bobot kelas" di tabel ini dioptimasi pada fold yang sama (optimistis); angka jujur ada di Section 11 (nested).*
+
+### Log eksperimen lanjutan (CatBoost GPU, fold 0, `src/exp_cat.py`)
+Bobot kelas dicari di separuh baris validasi dan dievaluasi di separuh lainnya (dua arah) → tidak optimistis.
+
+| # | Perubahan (vs baseline CatBoost lr 0,08) | Logloss | Macro F1 argmax | Macro F1 +bobot | Keputusan |
+|---|---|---:|---:|---:|---|
+| C0 | Baseline CatBoost depth 8, lr 0,08 | 0,7847 | 0,6158 | 0,6225 | – |
+| C1 | + TE interaksi bulan (hub×bulan, kurir×bulan, kota×bulan) | 0,7850 | 0,6159 | 0,6227 | ❌ netral |
+| C2 | + TE interaksi kategori barang (kurir×kategori, customer×kategori, hub×region) | 0,7850 | 0,6157 | 0,6224 | ❌ netral |
+| C3 | + TE interaksi rute (kurir×rute, hub×kota tujuan, customer×hub) | 0,7846 | 0,6155 | 0,6230 | ❌ marginal |
+| C4 | `customer_id`, `courier_id` sebagai kategori native CatBoost | 0,7860 | 0,6140 | 0,6232 | ❌ logloss memburuk |
+| C5 | depth 10, lr 0,05 | 0,7852 | 0,6152 | 0,6220 | ❌ |
+| C6 | lr 0,04 | 0,7834 | 0,6163 | 0,6236 | ✅ |
+| C7 | lr 0,02 | **0,7825** | 0,6168 | 0,6238 | ✅ |
+| C8 | **+ residual TE customer (Section 6.1)** | **0,7817** | **0,6173** | **0,6259** | ✅ **terbesar** |
+| C9 | + residual TE customer×hub | 0,7818 | 0,6163 | 0,6245 | ❌ |
+
+Data juga diperiksa untuk pola tersembunyi (urutan baris, duplikasi pesanan, hub di `scan_events`, customer di
+`invoices`, sebaran kolom noise per kelas): **tidak ada kebocoran** — semua sinyal berasal dari pemodelan.
 """)
 
 # ===================================================================================== 8
 md("""
 ## 8. Seleksi Fitur
-Importance (gain) dirata-rata dari 5 model LightGBM final. Kolom yang dicurigai noise dicek posisinya.
+Importance dirata-rata dari 5 model fold (LightGBM *gain* bila ada, jika tidak CatBoost *PredictionValuesChange*).
+Kolom yang dicurigai noise dicek posisinya.
 """)
 code("""
 lgb_files = [f"{ART}/models/lgb_s0_f{k}.txt" for k in range(5)]
+CAT_IMP = "cat_s11" if os.path.exists(f"{ART}/models/cat_s11_f0.cbm") else "cat_s0"  # model residual bila ada
+cat_files = [f"{ART}/models/{CAT_IMP}_f{k}.cbm" for k in range(5)]
+
+
+def with_te(df_rows: pl.DataFrame, X_rows: pd.DataFrame, k: int, feats: list) -> pd.DataFrame:
+    # tempel tabel TE fold k (+ residual TE bila model memakainya) lalu urutkan kolom sesuai model
+    Xk = apply_te_tables(df_rows, X_rows, f"{ART}/te/te_f{k}.parquet")
+    if any(f.startswith("rte_") for f in feats):
+        Xk = apply_te_tables(df_rows, Xk, f"{ART}/te/rte_f{k}.parquet", RESID_KEYS)
+    return Xk[feats]
+imp = None
 if all(os.path.exists(f) for f in lgb_files):
     boosters = [lgb.Booster(model_file=f) for f in lgb_files]
     imp = pd.DataFrame({"feat": boosters[0].feature_name(),
                         "gain": np.mean([b.feature_importance("gain") for b in boosters], 0)})
+    imp_src = "LightGBM (gain)"
+elif all(os.path.exists(f) for f in cat_files):
+    from catboost import CatBoostClassifier
+    cms = [CatBoostClassifier().load_model(f) for f in cat_files]
+    imp = pd.DataFrame({"feat": cms[0].feature_names_,
+                        "gain": np.mean([m.get_feature_importance() for m in cms], 0)})
+    imp_src = f"CatBoost {CAT_IMP} (PredictionValuesChange)"
+if imp is not None:
+    print("Sumber importance:", imp_src)
     imp["pct"] = imp.gain / imp.gain.sum() * 100
     imp = imp.sort_values("pct", ascending=False).reset_index(drop=True)
     pre = imp.feat.str.split("_").str[0]
@@ -443,7 +532,7 @@ if all(os.path.exists(f) for f in lgb_files):
           {c: int(imp.index[imp.feat == c][0]) + 1 for c in noise if c in set(imp.feat)})
     print(f"Fitur dengan gain < 0,01%: {(imp.pct < 0.01).sum()}")
 else:
-    print("Model LightGBM belum tersedia — jalankan MODE='train' terlebih dulu.")
+    print("Model belum tersedia — jalankan MODE='train' terlebih dulu.")
 """)
 md("""
 **Keputusan:** fitur tidak dipangkas. Kolom noise dan fitur ber-gain sangat kecil sudah jarang dipakai model
@@ -468,15 +557,24 @@ Macro F1 dioptimasi lewat bobot kelas pasca-training (Section 11).
 code_raw(grab("common.py", "LGB_PARAMS", "XGB_PARAMS", "CAT_PARAMS", "GPU_SWITCH", "fit_predict", "load_predict", "run_cv"))
 code("""
 if MODE == "train":
-    df_keys = df.select(sorted({c for cols, _ in TE_KEYS.values() for c in cols}))
+    key_cols = {c for cols, _ in TE_KEYS.values() for c in cols} | {c for cols, _ in RESID_KEYS.values() for c in cols}
+    df_keys = df.select(sorted(key_cols))
+    rcodes = te_codes(df, RESID_KEYS)
     np.save(f"{ART}/folds.npy", folds)
-    for model, seed in MODEL_RUNS:
-        print(f"===== {model} seed {seed} =====")
-        run_cv(model, seed, df_keys, X, y_all, tr_all, te_all, codes, folds, ART)
+    if any(r for _, _, r, _ in MODEL_RUNS):  # tahap A residual TE (Section 6.1)
+        np.save(f"{ART}/stageA_oof.npy", stage_a_oof(X, y_all, tr_all, folds, df))
+    for model, seed, resid, override in MODEL_RUNS:
+        print(f"===== {model} seed {seed} | residual TE={resid} | {override} =====")
+        P = {"cat": CAT_PARAMS, "xgb": XGB_PARAMS, "lgb": LGB_PARAMS}[model]
+        backup = dict(P); P.update(override)
+        R_all = resid_matrix(y_all, tr_all, np.load(f"{ART}/stageA_oof.npy")) if resid else None
+        run_cv(model, seed, df_keys, X, y_all, tr_all, te_all, codes, folds, ART,
+               rcodes=rcodes if resid else None, R_all=R_all)
+        P.clear(); P.update(backup)
 else:
     print("MODE='inference' → training dilewati; memuat hasil CV tersimpan.")
 
-runs = [(m, s) for m, s in MODEL_RUNS if os.path.exists(f"{ART}/oof_{m}_s{s}.npy")]
+runs = [(m, s) for m, s, *_ in MODEL_RUNS if os.path.exists(f"{ART}/oof_{m}_s{s}.npy")]
 oofs = {f"{m}_s{s}": np.load(f"{ART}/oof_{m}_s{s}.npy") for m, s in runs}
 cv_rows = []
 for name, o in oofs.items():
@@ -525,11 +623,58 @@ CLASS_W = optimize_class_weights(oof_b, y_tr)
 print("Bobot kelas final:", dict(zip(CLASSES, CLASS_W.round(3))))
 print(f"OOF Macro F1 dengan bobot final: {macro_f1(y_tr, oof_b, CLASS_W):.4f}")
 """)
+md("""
+**Cek pergeseran bulan (Section 2.1).** Apakah bobot kelas perlu disetel dengan baris OOF yang diberi *importance
+weight* P_test(bulan)/P_train(bulan)? Bobot ini hanya memakai fitur test, bukan label. Diuji secara nested dan
+dievaluasi pada distribusi bulan ala test.
+""")
+code_raw(grab("common.py", "month_shift_weights"))
 code("""
-pred_oof = (oof_b * CLASS_W).argmax(1)
+SW = month_shift_weights(df["ship_month"].to_numpy()[tr_all], df["ship_month"].to_numpy()[te_all])
+rows = []
+for k in range(5):
+    a, b = folds != k, folds == k
+    w_plain = optimize_class_weights(oof_b[a], y_tr[a])
+    w_month = optimize_class_weights(oof_b[a], y_tr[a], sw=SW[a])
+    rows.append(dict(fold=k, bobot_biasa=macro_f1(y_tr[b], oof_b[b], w_plain, SW[b]),
+                     bobot_bulan=macro_f1(y_tr[b], oof_b[b], w_month, SW[b])))
+shift = pd.DataFrame(rows)
+display(shift.round(4))
+print(f"Selisih rata-rata (bulan − biasa): {(shift.bobot_bulan - shift.bobot_biasa).mean():+.4f} "
+      f"→ jauh di bawah std antar fold; dipakai bobot biasa (lebih sederhana)")
+""")
+md("""
+### 11.1 Matriks keputusan penuh
+Bobot diagonal hanya menggeser skor tiap kelas secara independen. Untuk metrik *fractional-linear* seperti Macro F1,
+klasifikasi optimal Bayes berbentuk $\\arg\\max_j (P\\,W)_j$ dengan $W$ matriks **penuh**
+([Narasimhan et al., ICML 2015](https://proceedings.mlr.press/v37/narasimhanb15.html)). Elemen $W_{ij}$ (i≠j)
+mengizinkan proba kelas *i* ikut mendorong/menahan kelas *j* (mis. kelas yang sering tertukar).
+$W$ dimulai dari `diag(CLASS_W)` lalu disempurnakan dengan *coordinate ascent*. Divalidasi **nested** seperti di atas.
+""")
+code_raw(grab("common.py", "f1_matrix", "optimize_decision_matrix"))
+code("""
+from joblib import Parallel, delayed
+
+def _nested_matrix(k):
+    a, b = folds != k, folds == k
+    w_k = optimize_class_weights(oof_b[a], y_tr[a])
+    W_k = optimize_decision_matrix(oof_b[a], y_tr[a], w_k)
+    return dict(fold=k, diagonal=macro_f1(y_tr[b], oof_b[b], w_k), matriks=f1_matrix(y_tr[b], oof_b[b], W_k))
+
+nested_m = pd.DataFrame(Parallel(n_jobs=5)(delayed(_nested_matrix)(k) for k in range(5)))
+nested_m["selisih"] = nested_m.matriks - nested_m.diagonal
+display(nested_m.round(4))
+print(f"NESTED Macro F1: diagonal {nested_m.diagonal.mean():.4f} → matriks {nested_m.matriks.mean():.4f} "
+      f"({nested_m.selisih.mean():+.4f} ± {nested_m.selisih.std():.4f}, naik di {(nested_m.selisih > 0).sum()}/5 fold)")
+DECISION_W = optimize_decision_matrix(oof_b, y_tr, CLASS_W)
+print(f"OOF Macro F1 dengan matriks final: {f1_matrix(y_tr, oof_b, DECISION_W):.4f}")
+display(pd.DataFrame(DECISION_W, index=CLASSES, columns=CLASSES).round(3))
+""")
+code("""
+pred_oof = (oof_b @ DECISION_W).argmax(1)
 cmp = pd.DataFrame({"asli": np.bincount(y_tr, minlength=K) / len(y_tr),
                     "prediksi argmax": np.bincount(oof_b.argmax(1), minlength=K) / len(y_tr),
-                    "prediksi berbobot": np.bincount(pred_oof, minlength=K) / len(y_tr)}, index=CLASSES)
+                    "prediksi matriks keputusan": np.bincount(pred_oof, minlength=K) / len(y_tr)}, index=CLASSES)
 ax = (cmp * 100).plot.bar(figsize=(10, 3.8), rot=20, color=["#999999", "#4C72B0", "#55A868"])
 ax.set(title="Distribusi kelas: asli vs prediksi OOF", ylabel="%"); plt.tight_layout(); plt.show()
 """)
@@ -546,11 +691,20 @@ ax.set(title="Confusion matrix OOF (normalisasi per baris = recall)", xlabel="pr
 plt.xticks(rotation=30, ha="right"); plt.tight_layout(); plt.show()
 """)
 code("""
-# Kontribusi fitur (SHAP-like, TreeSHAP bawaan LightGBM) untuk kelas-kelas tersulit, sampel 4.000 baris fold 0
+# Kontribusi fitur (TreeSHAP bawaan LightGBM / CatBoost) untuk kelas-kelas tersulit, sampel baris validasi fold 0
+contrib = None
 if all(os.path.exists(f) for f in lgb_files):
     va0 = tr_all[folds == 0][:4000]
     Xs = apply_te_tables(df[va0], X.iloc[va0], f"{ART}/te/te_f0.parquet")[boosters[0].feature_name()]
     contrib = boosters[0].predict(Xs, pred_contrib=True).reshape(len(Xs), K, -1)[:, :, :-1]
+elif all(os.path.exists(f) for f in cat_files):
+    from catboost import Pool
+    va0 = tr_all[folds == 0][:2000]
+    Xs = with_te(df[va0], X.iloc[va0], 0, cms[0].feature_names_)
+    cats = [c for c in Xs.columns if str(Xs[c].dtype) == "category"]
+    pool = Pool(Xs.assign(**{c: Xs[c].astype(str) for c in cats}), cat_features=cats)
+    contrib = cms[0].get_feature_importance(pool, type="ShapValues")[:, :, :-1]  # (n, K, fitur)
+if contrib is not None:
     focus = ["gagal_antar_awal", "retur_pengirim", "rusak_perjalanan", "klaim_hilang"]
     fig, axes = plt.subplots(1, 4, figsize=(18, 4.5))
     for ax, c in zip(axes, focus):
@@ -572,12 +726,14 @@ md("""
 | `artifacts/te/te_f{k}_{kunci}.parquet` | tabel target encoding per fold |
 | `artifacts/folds.npy` | pembagian fold |
 | `artifacts/oof_*.npy`, `test_*.npy` | proba OOF & test per model (untuk blending & cek reproducibility) |
-| `artifacts/ensemble.json` | daftar model, bobot blend, bobot kelas, skor CV |
+| `artifacts/ensemble.json` | daftar model, bobot blend, bobot kelas, matriks keputusan, skor CV |
 """)
 code("""
-ensemble_cfg = dict(models=names, blend_weights=bw.tolist(), class_weights=CLASS_W.tolist(), classes=CLASSES,
-                    oof_logloss=float(log_loss(y_tr, oof_b)), oof_macro_f1=float(macro_f1(y_tr, oof_b, CLASS_W)),
-                    nested_macro_f1=float(nested.f1_weighted.mean()), nested_std=float(nested.f1_weighted.std()))
+ensemble_cfg = dict(models=names, blend_weights=bw.tolist(), class_weights=CLASS_W.tolist(),
+                    decision_matrix=DECISION_W.tolist(), classes=CLASSES,
+                    oof_logloss=float(log_loss(y_tr, oof_b)), oof_macro_f1=float(f1_matrix(y_tr, oof_b, DECISION_W)),
+                    nested_macro_f1_diag=float(nested.f1_weighted.mean()),
+                    nested_macro_f1=float(nested_m.matriks.mean()), nested_std=float(nested_m.matriks.std()))
 json.dump(ensemble_cfg, open(f"{ART}/ensemble.json", "w"), indent=1)  # deterministik dari OOF tersimpan
 ensemble_cfg = json.load(open(f"{ART}/ensemble.json"))                 # inference di bawah hanya membaca file ini
 sizes = {}
@@ -593,24 +749,24 @@ md("""
 ## 14. Inferensi Tanpa Retrain → `submission.csv`
 Bagian ini **hanya memuat file**: model per fold + tabel TE per fold + konfigurasi ensemble. Pipeline fitur test
 adalah fungsi `build()` yang sama dengan train. Alur per model: untuk tiap fold *k*, tempel TE fold *k* → muat model
-fold *k* → proba, lalu rata-rata 5 fold → blend geometrik → × bobot kelas → argmax.
+fold *k* → proba, lalu rata-rata 5 fold → blend geometrik → × matriks keputusan W → argmax.
 """)
 code("""
 def predict_test(df: pl.DataFrame, X: pd.DataFrame, te_all: np.ndarray, cfg: dict) -> tuple[np.ndarray, dict]:
-    features = json.load(open(f"{ART}/features.json")) if os.path.exists(f"{ART}/features.json") \\
-        else lgb.Booster(model_file=f"{ART}/models/lgb_s0_f0.txt").feature_name()
     df_te, X_te = df[te_all], X.iloc[te_all]
     probs = {}
     for name in cfg["models"]:
         model, seed = name.rsplit("_s", 1)
+        ff = f"{ART}/features_{name}.json"  # urutan fitur per model (model residual punya kolom rte_*)
+        features = json.load(open(ff if os.path.exists(ff) else f"{ART}/features.json"))
         p = np.zeros((len(te_all), K))
         for k in range(5):
-            Xk = apply_te_tables(df_te, X_te, f"{ART}/te/te_f{k}.parquet")[features]
+            Xk = with_te(df_te, X_te, k, features)
             p += load_predict(model, f"{ART}/models/{model}_s{seed}_f{k}", Xk) / 5
         probs[name] = p
         print(f"✓ {name}: 5 fold diprediksi")
     pb = blend([probs[n] for n in cfg["models"]], cfg["blend_weights"])
-    return (pb * np.array(cfg["class_weights"])).argmax(1), probs
+    return (pb @ np.array(cfg["decision_matrix"], dtype=np.float32)).argmax(1), probs
 
 
 t0 = time.time()
@@ -646,8 +802,19 @@ Tabel CV per model (Section 9), ensemble (Section 10), dan **Macro F1 nested** (
 private yang paling jujur. Seluruh keputusan diambil dari CV lokal, **bukan** public LB (hanya 30% test).
 
 ### 2 final pick
-1. **Ensemble** LightGBM + CatBoost + XGBoost + bobot kelas (CV terbaik).
-2. **Hedge:** LightGBM tunggal + bobot kelas (lebih sederhana, tanpa ketergantungan blend).
+1. **Ensemble residual**: CatBoost lr 0,02 + CatBoost lr 0,04 + XGBoost, semuanya dengan residual TE customer,
+   + matriks keputusan (CV terbaik, nested Macro F1 ±0,6294).
+2. **Hedge tanpa residual TE**: CatBoost (3 varian) + XGBoost + matriks keputusan (nested ±0,6283), untuk berjaga
+   seandainya residual TE berperilaku berbeda di data test.
+
+| Tahap | Nested Macro F1 |
+|---|---:|
+| CatBoost lr 0,08 + bobot kelas diagonal | 0,6256 |
+| + XGBoost (ensemble) | 0,6267 |
+| + matriks keputusan penuh + CatBoost lr kecil | 0,6283 |
+| **+ residual TE customer (final)** | **0,6294** |
+
+LightGBM (`src/train.py lgb 0`) bisa ditambahkan ke `MODEL_RUNS`; notebook otomatis memakainya jika artefaknya ada.
 
 ### Anti-overfit checklist
 - [x] Semua yang memakai target (TE, bobot blend, bobot kelas) dihitung di dalam fold / divalidasi nested
